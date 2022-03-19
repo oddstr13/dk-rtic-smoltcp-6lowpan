@@ -61,6 +61,14 @@ mod app {
         //let board = hal::init().unwrap();
         let clocks = &*unsafe { CLOCKS.get_or_insert(_clocks) };
 
+        (*cx.device.USBD).intenset.write(|w| {
+            w.sof().set_bit();
+            w.usbevent().set_bit();
+            w.ep0datadone().set_bit();
+            w.ep0setup().set_bit();
+            w.usbreset().set_bit()
+        });
+
         cx.local
             .usb_bus
             .replace(Usbd::new(UsbPeripheral::new(cx.device.USBD, &clocks)));
@@ -80,7 +88,6 @@ mod app {
         .build();
 
         task1::spawn().ok();
-        usb_poller::spawn_after(1.millis()).ok();
 
         (Shared { serial }, Local { usb_dev }, init::Monotonics(mono))
     }
@@ -96,33 +103,10 @@ mod app {
 
         task1::spawn_after(5000.millis()).ok();
     }
-    
-    #[task(local=[usb_dev], shared=[serial])]
-    fn usb_poller(mut cx: usb_poller::Context) {
-        //rprintln!("task1");
 
-        let usb_dev = cx.local.usb_dev;
-
-        cx.shared.serial.lock(|serial| {
-            let mut buf = [0u8; 64];
-            if usb_dev.poll(&mut [serial]) {
-                match serial.read(&mut buf) {
-                    Ok(count) if count > 0 => {
-                       rprintln!("Data received '{:?}'", buf);
-                    },
-                    Ok(_) => {},
-                    Err(_) => {},
-                }
-            }
-        });
-
-        usb_poller::spawn_after(1.millis()).ok();
-    }
-    
-    /*
     #[task(binds=USBD, local=[usb_dev], shared=[serial])]
     fn usb_handler(mut cx: usb_handler::Context) {
-        rprintln!("usb_handler");
+        //rprintln!("usb_handler");
         let usb_dev = cx.local.usb_dev;
 
         cx.shared.serial.lock(|serial| {
@@ -137,11 +121,5 @@ mod app {
                 }
             }
         });
-    }
-    */
-
-    #[task(binds=USBD)]
-    fn usb_handler(mut cx: usb_handler::Context) {
-        rprintln!("usb_handler");
     }
 }
