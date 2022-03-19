@@ -80,6 +80,7 @@ mod app {
         .build();
 
         task1::spawn().ok();
+        usb_poller::spawn_after(1.millis()).ok();
 
         (Shared { serial }, Local { usb_dev }, init::Monotonics(mono))
     }
@@ -95,10 +96,11 @@ mod app {
 
         task1::spawn_after(5000.millis()).ok();
     }
-    ///*
-    #[task(binds=USBD, local=[usb_dev], shared=[serial])]
-    fn usb_handler(mut cx: usb_handler::Context) {
-        rprintln!("usb_worker");
+    
+    #[task(local=[usb_dev], shared=[serial])]
+    fn usb_poller(mut cx: usb_poller::Context) {
+        //rprintln!("task1");
+
         let usb_dev = cx.local.usb_dev;
 
         cx.shared.serial.lock(|serial| {
@@ -113,5 +115,33 @@ mod app {
                 }
             }
         });
-    } //*/
+
+        usb_poller::spawn_after(1.millis()).ok();
+    }
+    
+    /*
+    #[task(binds=USBD, local=[usb_dev], shared=[serial])]
+    fn usb_handler(mut cx: usb_handler::Context) {
+        rprintln!("usb_handler");
+        let usb_dev = cx.local.usb_dev;
+
+        cx.shared.serial.lock(|serial| {
+            let mut buf = [0u8; 64];
+            if usb_dev.poll(&mut [serial]) {
+                match serial.read(&mut buf) {
+                    Ok(count) if count > 0 => {
+                       rprintln!("Data received '{:?}'", buf);
+                    },
+                    Ok(_) => {},
+                    Err(_) => {},
+                }
+            }
+        });
+    }
+    */
+
+    #[task(binds=USBD)]
+    fn usb_handler(mut cx: usb_handler::Context) {
+        rprintln!("usb_handler");
+    }
 }
