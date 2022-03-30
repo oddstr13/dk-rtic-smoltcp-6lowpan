@@ -2,7 +2,7 @@
 
 // RTIC Monotonic impl for the 32-bit timers
 pub use fugit::{self, ExtU32};
-use nrf52840_hal::pac::{timer0, TIMER0, TIMER1, TIMER2};
+use hal::pac::{timer0, TIMER0, TIMER1, TIMER2}; // nrf52840_hal
 use rtic_monotonic::Monotonic;
 
 pub struct MonoTimer<T: Instance32>(T);

@@ -4,12 +4,16 @@
 #![no_main]
 #![no_std]
 
+use core::str;
+
 use crate::monotonic_nrf52::MonoTimer;
 use fugit::{self, ExtU32};
-use nrf52840_hal as hal;
+use hal; // nrf52840_hal
 use panic_rtt_target as _;
 use rtic::app;
-use rtt_target::{rprintln, rtt_init_print};
+use rtt_target::{rprint, rprintln, rtt_init_print};
+
+use heapless::spsc::{Consumer, Producer, Queue};
 
 // USB Serial
 use hal::clocks::{self, Clocks};
@@ -22,14 +26,16 @@ use usb_device::prelude::UsbDevice;
 use usbd_serial::{SerialPort, USB_CLASS_CDC};
 
 mod monotonic_nrf52;
+mod radio;
 
-#[app(device = nrf52840_hal::pac, peripherals = true, dispatchers = [SWI0_EGU0])]
+#[app(device = hal::pac, peripherals = true, dispatchers = [SWI0_EGU0])]
 mod app {
     use super::*;
 
     #[shared]
     struct Shared {
         serial: SerialPort<'static, Usbd<UsbPeripheral<'static>>>,
+        radio: radio::Radio<'static>,
     }
 
     #[local]
@@ -38,7 +44,7 @@ mod app {
     }
 
     #[monotonic(binds = TIMER1, default = true)]
-    type Tonic = MonoTimer<nrf52840_hal::pac::TIMER1>;
+    type Tonic = MonoTimer<hal::pac::TIMER1>;
 
     #[init(local = [EP_MEMORY: [u32; 1024] = [0; 1024], usb_bus: Option<UsbBusAllocator<Usbd<UsbPeripheral<'static>>>> = None])]
     fn init(cx: init::Context) -> (Shared, Local, init::Monotonics) {
@@ -47,6 +53,7 @@ mod app {
         rtt_init_print!();
         rprintln!("init");
 
+        rprintln!("clocks");
         static mut CLOCKS: Option<
             Clocks<clocks::ExternalOscillator, clocks::ExternalOscillator, clocks::LfOscStarted>,
         > = None;
@@ -61,6 +68,8 @@ mod app {
         //let board = hal::init().unwrap();
         let clocks = &*unsafe { CLOCKS.get_or_insert(_clocks) };
 
+        rprintln!("usb");
+        // Enable USB interrupts
         (*cx.device.USBD).intenset.write(|w| {
             w.sof().set_bit();
             w.usbevent().set_bit();
@@ -87,21 +96,51 @@ mod app {
         .max_packet_size_0(64) // (makes control transfers 8x faster)
         .build();
 
+        rprintln!("radio");
+        //(*cx.device.RADIO).intenset.write(|w| {
+        //    w.payload().set_bit();
+        //    w.framestart().set_bit()
+        //});
+        let mut radio = radio::Radio::init(cx.device.RADIO, &clocks);
+        let mut packet = radio::Packet::new();
+        let foo = radio.enable_rx(packet);
+        // these are the default settings of the DK's radio
+        // NOTE if you ran `change-channel` then you may need to update the channel here
+        radio.set_channel(radio::Channel::_11); // <- must match the Dongle's listening channel
+        radio.set_txpower(radio::TxPower::Pos8dBm);
+
         task1::spawn().ok();
 
-        (Shared { serial }, Local { usb_dev }, init::Monotonics(mono))
+        rprintln!("init done");
+        (
+            Shared { serial, radio },
+            Local { usb_dev },
+            init::Monotonics(mono),
+        )
     }
 
-    #[task(shared=[serial])]
+    #[task(shared=[serial, radio])]
     fn task1(mut cx: task1::Context) {
         rprintln!("task1");
 
+        /*
         cx.shared.serial.lock(|serial| {
             serial.write(b"task1\r\n").ok();
             serial.flush().ok();
         });
-
-        task1::spawn_after(5000.millis()).ok();
+        let mut packet = radio::Packet::new();
+        cx.shared.radio.lock(|radio| {
+            match radio.recv(&mut packet) {
+                Ok(crc) => {
+                    rprintln!("RX CRC OK");
+                }
+                Err(crc) => {
+                    rprintln!("RX CRC ERR");
+                }
+            };
+        });
+ */
+        task1::spawn_after(1000.millis()).ok();
     }
 
     #[task(binds=USBD, local=[usb_dev], shared=[serial])]
@@ -114,12 +153,30 @@ mod app {
             if usb_dev.poll(&mut [serial]) {
                 match serial.read(&mut buf) {
                     Ok(count) if count > 0 => {
-                       rprintln!("Data received '{:?}'", buf);
-                    },
-                    Ok(_) => {},
-                    Err(_) => {},
+                        rprint!("Data received ({}): ", count);
+                        rprint!(
+                            str::from_utf8(&buf[0..count]).expect("msg is not valid UTF-8 data")
+                        );
+                        rprintln!();
+                    }
+                    Ok(_) => {}
+                    Err(_) => {}
                 }
             }
         });
+    }
+
+    #[task(binds=RADIO, shared=[radio, serial])]
+    fn radio_handler(mut cx: radio_handler::Context) {
+        cx.shared.radio.lock(|radio| match radio.poll() {
+            Ok(o_packet) => match o_packet {
+                Some(packet) => {
+                    
+                },
+                None => {},
+            },
+            Err(_) => {},
+        });
+        //rprintln!("radio_handler");
     }
 }

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! IEEE 802.15.4 radio
 // nrf-hal/ieee802154.rs
 
@@ -9,7 +10,7 @@ use core::{
 
 use embedded_hal::timer::CountDown as _;
 
-use crate::{
+use hal::{
     clocks::{Clocks, ExternalOscillator},
     pac::{
         radio::{state::STATE_A, txpower::TXPOWER_A},
@@ -18,6 +19,12 @@ use crate::{
     timer::{self, Timer},
 };
 
+pub enum RadioMode {
+    Disabled,
+    Rx,
+    Tx,
+}
+
 /// IEEE 802.15.4 radio
 pub struct Radio<'c> {
     radio: RADIO,
@@ -25,6 +32,9 @@ pub struct Radio<'c> {
     needs_enable: bool,
     // used to freeze `Clocks`
     _clocks: PhantomData<&'c ()>,
+    current_dma: Option<Packet>,
+    next_dma: Option<Packet>,
+    mode: RadioMode,
 }
 
 /// Default Clear Channel Assessment method = Carrier sense
@@ -155,6 +165,9 @@ impl<'c> Radio<'c> {
             needs_enable: false,
             radio,
             _clocks: PhantomData,
+            current_dma: None,
+            next_dma: None,
+            mode: RadioMode::Disabled,
         };
 
         // shortcuts will be kept off by default and only be temporarily enabled within blocking
@@ -302,11 +315,165 @@ impl<'c> Radio<'c> {
         }
     }
 
+    pub fn enable_rx(&mut self, packet: Packet) -> Option<Packet> {
+        self.mode = RadioMode::Rx;
+        // NOTE we do NOT check the address of `packet` because the mutable reference ensures it's
+        // allocated in RAM
+
+        // TODO: Check packet buffer address
+        // https://stackoverflow.com/a/58011841
+        // let addr = packet.buffer.as_ptr() as usize;
+
+        let mut retval: Option<Packet> = None;
+
+        // clear related events
+        self.radio.events_phyend.reset();
+        self.radio.events_end.reset();
+
+        /*
+        if disable {
+            self.radio
+                .tasks_disable
+                .write(|w| w.tasks_disable().set_bit());
+            self.wait_for_state_a(STATE_A::DISABLED);
+        }
+        */
+
+        if self.current_dma.is_some() {
+            let _ = retval.insert(self.current_dma.take().unwrap());
+        }
+
+        /*
+        As illustrated in RADIO block diagram on page 307, the RADIO's EasyDMA utilizes the same PACKETPTR
+        for receiving and transmitting packets. This pointer should be reconfigured by the CPU each time before
+        RADIO is started by the START task. The PACKETPTR registers is double-buffered, meaning that it can be
+        updated and prepared for the next transmission.
+         */
+
+        // NOTE(unsafe) DMA transfer has not yet started
+        // set up RX buffer
+        let _packet = self.current_dma.insert(packet);
+        unsafe {
+            self.radio
+                .packetptr
+                .write(|w| w.packetptr().bits(_packet.buffer.as_mut_ptr() as u32));
+        }
+
+        // Disable all interrupts, then enable the ones we are handling
+        self.radio.intenset.reset();
+        self.radio.intenset.write(|w| {
+            w.end().set_bit();
+            w.phyend().set_bit();
+            w.ready().set_bit();
+            w.rxready().set_bit();
+            w.framestart().clear_bit();
+            w.payload().clear_bit();
+            w
+        });
+
+        self.radio.shorts.reset();
+
+        if self.radio.state.read().state().variant().unwrap() == STATE_A::TX {
+            self.radio.shorts.modify(|_, w| {
+                w.phyend_disable().set_bit();
+                w.disabled_rxen().set_bit();
+                w
+            });
+
+            while self.radio.state.read().state().variant().unwrap() == STATE_A::TX {}
+        }
+
+        self.radio.shorts.modify(|_, w| {
+            w.phyend_disable().clear_bit();
+            w.rxready_start().set_bit();
+            //w.end_start().set_bit(); // ! Not for IEEE 802.15.4, use PHYEND->START
+            w.phyend_start().set_bit();
+            w.disabled_rxen().set_bit();
+            w
+        });
+        // start transfer
+
+        dma_start_fence();
+
+        match self.radio.state.read().state().variant().unwrap() {
+            STATE_A::DISABLED => {
+                self.radio.tasks_rxen.write(|w| w.tasks_rxen().set_bit());
+            }
+            STATE_A::RXDISABLE | STATE_A::TXDISABLE => {}
+            STATE_A::RXRU | STATE_A::RXIDLE => {}
+            STATE_A::TXRU | STATE_A::TXIDLE => {
+                self.radio
+                    .tasks_disable
+                    .write(|w| w.tasks_disable().set_bit());
+            }
+            STATE_A::RX => {}
+            STATE_A::TX => {
+                //self.radio.tasks_stop.write(|w| w.tasks_stop().set_bit());
+            }
+        }
+
+        retval
+    }
+
+    pub fn poll(&mut self) -> Result<Option<Packet>, ()> {
+        if self.radio.events_end.read().events_end().bit_is_set() {
+            self.radio.events_end.reset();
+            rtt_target::rprintln!("poll:END");
+        }
+
+        if self.radio.events_phyend.read().events_phyend().bit_is_set() {
+            self.radio.events_phyend.reset();
+            rtt_target::rprintln!("poll:PHYEND");
+        }
+
+        if self.radio.events_ready.read().events_ready().bit_is_set() {
+            self.radio.events_ready.reset();
+            rtt_target::rprintln!("poll:READY");
+        }
+
+        if self
+            .radio
+            .events_rxready
+            .read()
+            .events_rxready()
+            .bit_is_set()
+        {
+            self.radio.events_rxready.reset();
+            rtt_target::rprintln!("poll:RXREADY");
+        }
+
+        if self
+            .radio
+            .events_framestart
+            .read()
+            .events_framestart()
+            .bit_is_set()
+        {
+            self.radio.events_framestart.reset();
+            rtt_target::rprintln!("poll:FRAMESTART");
+        }
+
+        if self
+            .radio
+            .events_payload
+            .read()
+            .events_payload()
+            .bit_is_set()
+        {
+            self.radio.events_payload.reset();
+            rtt_target::rprintln!("poll:PAYLOAD");
+        }
+
+        return Ok(None);
+        //return Err(());
+    }
+
     /// Receives one radio packet and copies its contents into the given `packet` buffer
     ///
     /// This methods returns the `Ok` variant if the CRC included the packet was successfully
     /// validated by the hardware; otherwise it returns the `Err` variant. In either case, `packet`
     /// will be updated with the received packet's data
+    #[deprecated]
     pub fn recv(&mut self, packet: &mut Packet) -> Result<u16, u16> {
         // Start the read
         // NOTE(unsafe) We block until reception completes or errors
@@ -338,6 +505,7 @@ impl<'c> Radio<'c> {
     /// Note that the time it takes to switch the radio to RX mode is included in the timeout count.
     /// This transition may take up to a hundred of microseconds; see the section 6.20.15.8 in the
     /// Product Specification for more details about timing
+    #[deprecated]
     pub fn recv_timeout<I>(
         &mut self,
         packet: &mut Packet,
@@ -387,6 +555,7 @@ impl<'c> Radio<'c> {
         }
     }
 
+    #[deprecated]
     unsafe fn start_recv(&mut self, packet: &mut Packet) {
         // NOTE we do NOT check the address of `packet` because the mutable reference ensures it's
         // allocated in RAM
@@ -396,6 +565,13 @@ impl<'c> Radio<'c> {
         self.radio.events_end.reset();
 
         self.put_in_rx_mode();
+
+        /*
+        As illustrated in RADIO block diagram on page 307, the RADIO's EasyDMA utilizes the same PACKETPTR
+        for receiving and transmitting packets. This pointer should be reconfigured by the CPU each time before
+        RADIO is started by the START task. The PACKETPTR registers is double-buffered, meaning that it can be
+        updated and prepared for the next transmission.
+         */
 
         // NOTE(unsafe) DMA transfer has not yet started
         // set up RX buffer
@@ -408,6 +584,7 @@ impl<'c> Radio<'c> {
         self.radio.tasks_start.write(|w| w.tasks_start().set_bit());
     }
 
+    #[deprecated]
     fn cancel_recv(&mut self) {
         self.radio.tasks_stop.write(|w| w.tasks_stop().set_bit());
         self.wait_for_state_a(STATE_A::RXIDLE);
@@ -425,6 +602,7 @@ impl<'c> Radio<'c> {
     /// ensure the `packet` buffer is allocated in RAM, which is required by the RADIO peripheral
     // NOTE we do NOT check the address of `packet` because the mutable reference ensures it's
     // allocated in RAM
+    #[deprecated]
     pub fn try_send(&mut self, packet: &mut Packet) -> Result<(), ()> {
         // enable radio to perform cca
         self.put_in_rx_mode();
@@ -492,6 +670,7 @@ impl<'c> Radio<'c> {
     /// ensure the `packet` buffer is allocated in RAM, which is required by the RADIO peripheral
     // NOTE we do NOT check the address of `packet` because the mutable reference ensures it's
     // allocated in RAM
+    #[deprecated]
     pub fn send(&mut self, packet: &mut Packet) {
         // enable radio to perform cca
         self.put_in_rx_mode();
@@ -559,6 +738,7 @@ impl<'c> Radio<'c> {
     /// ensure the `packet` buffer is allocated in RAM, which is required by the RADIO peripheral
     // NOTE we do NOT check the address of `packet` because the mutable reference ensures it's
     // allocated in RAM
+    #[deprecated]
     pub fn send_no_cca(&mut self, packet: &mut Packet) {
         self.put_in_tx_mode();
 
@@ -648,6 +828,7 @@ impl<'c> Radio<'c> {
     }
 
     /// Moves the radio to the TXIDLE state
+    #[deprecated]
     fn put_in_tx_mode(&mut self) {
         let state = self.state();
 
