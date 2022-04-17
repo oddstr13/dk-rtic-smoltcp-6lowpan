@@ -41,6 +41,7 @@ mod app {
     #[local]
     struct Local {
         usb_dev: UsbDevice<'static, Usbd<UsbPeripheral<'static>>>,
+        packet: Option<radio::Packet>,
     }
 
     #[monotonic(binds = TIMER1, default = true)]
@@ -101,20 +102,27 @@ mod app {
         //    w.payload().set_bit();
         //    w.framestart().set_bit()
         //});
-        let mut radio = radio::Radio::init(cx.device.RADIO, &clocks);
-        let mut packet = radio::Packet::new();
-        let foo = radio.enable_rx(packet);
+        let mut packet1 = radio::Packet::new();
+        let mut packet2 = radio::Packet::new();
+        let mut radio = radio::Radio::init(cx.device.RADIO, &clocks, packet1, packet2);
+
         // these are the default settings of the DK's radio
         // NOTE if you ran `change-channel` then you may need to update the channel here
-        radio.set_channel(radio::Channel::_11); // <- must match the Dongle's listening channel
+        radio.set_channel(radio::Channel::_15); // <- must match the Dongle's listening channel
         radio.set_txpower(radio::TxPower::Pos8dBm);
+
+        radio.enable_rx();
 
         task1::spawn().ok();
 
         rprintln!("init done");
+
         (
             Shared { serial, radio },
-            Local { usb_dev },
+            Local {
+                usb_dev,
+                packet: Some(radio::Packet::new()),
+            },
             init::Monotonics(mono),
         )
     }
@@ -124,23 +132,23 @@ mod app {
         rprintln!("task1");
 
         /*
-        cx.shared.serial.lock(|serial| {
-            serial.write(b"task1\r\n").ok();
-            serial.flush().ok();
-        });
-        let mut packet = radio::Packet::new();
-        cx.shared.radio.lock(|radio| {
-            match radio.recv(&mut packet) {
-                Ok(crc) => {
-                    rprintln!("RX CRC OK");
-                }
-                Err(crc) => {
-                    rprintln!("RX CRC ERR");
-                }
-            };
-        });
- */
-        task1::spawn_after(1000.millis()).ok();
+               cx.shared.serial.lock(|serial| {
+                   serial.write(b"task1\r\n").ok();
+                   serial.flush().ok();
+               });
+               let mut packet = radio::Packet::new();
+               cx.shared.radio.lock(|radio| {
+                   match radio.recv(&mut packet) {
+                       Ok(crc) => {
+                           rprintln!("RX CRC OK");
+                       }
+                       Err(crc) => {
+                           rprintln!("RX CRC ERR");
+                       }
+                   };
+               });
+        */
+        task1::spawn_after(60000.millis()).ok();
     }
 
     #[task(binds=USBD, local=[usb_dev], shared=[serial])]
@@ -166,17 +174,23 @@ mod app {
         });
     }
 
-    #[task(binds=RADIO, shared=[radio, serial])]
+    #[task(binds=RADIO, shared=[radio, serial], local=[packet])]
     fn radio_handler(mut cx: radio_handler::Context) {
-        cx.shared.radio.lock(|radio| match radio.poll() {
-            Ok(o_packet) => match o_packet {
-                Some(packet) => {
-                    
-                },
-                None => {},
+        rprintln!();
+        rprintln!("radio_handler");
+
+        cx.shared.radio.lock(|radio| match radio.poll(cx.local.packet.take().unwrap()) {
+            Ok(packet) => {
+                if packet.len() > 0 {
+                    rprintln!("Packet: {}", packet.len());
+                    rprint!(str::from_utf8(&*packet).expect("invalid utf8"));
+                    rprintln!();
+                } else {
+                    rprintln!("No data");
+                }
+                let _ = cx.local.packet.insert(packet);
             },
-            Err(_) => {},
+            Err(_) => {}
         });
-        //rprintln!("radio_handler");
     }
 }

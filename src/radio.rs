@@ -160,13 +160,22 @@ impl TxPower {
 
 impl<'c> Radio<'c> {
     /// Initializes the radio for IEEE 802.15.4 operation
-    pub fn init<L, LSTAT>(radio: RADIO, _clocks: &'c Clocks<ExternalOscillator, L, LSTAT>) -> Self {
+    pub fn init<L, LSTAT>(
+        radio: RADIO,
+        _clocks: &'c Clocks<ExternalOscillator, L, LSTAT>,
+        mut packet1: Packet,
+        mut packet2: Packet,
+    ) -> Self {
+
+        packet1.set_len(0);
+        packet2.set_len(0);
+
         let mut radio = Self {
             needs_enable: false,
             radio,
             _clocks: PhantomData,
-            current_dma: None,
-            next_dma: None,
+            current_dma: Some(packet1),
+            next_dma: Some(packet2),
             mode: RadioMode::Disabled,
         };
 
@@ -315,16 +324,8 @@ impl<'c> Radio<'c> {
         }
     }
 
-    pub fn enable_rx(&mut self, packet: Packet) -> Option<Packet> {
+    pub fn enable_rx(&mut self) {
         self.mode = RadioMode::Rx;
-        // NOTE we do NOT check the address of `packet` because the mutable reference ensures it's
-        // allocated in RAM
-
-        // TODO: Check packet buffer address
-        // https://stackoverflow.com/a/58011841
-        // let addr = packet.buffer.as_ptr() as usize;
-
-        let mut retval: Option<Packet> = None;
 
         // clear related events
         self.radio.events_phyend.reset();
@@ -339,10 +340,6 @@ impl<'c> Radio<'c> {
         }
         */
 
-        if self.current_dma.is_some() {
-            let _ = retval.insert(self.current_dma.take().unwrap());
-        }
-
         /*
         As illustrated in RADIO block diagram on page 307, the RADIO's EasyDMA utilizes the same PACKETPTR
         for receiving and transmitting packets. This pointer should be reconfigured by the CPU each time before
@@ -352,11 +349,10 @@ impl<'c> Radio<'c> {
 
         // NOTE(unsafe) DMA transfer has not yet started
         // set up RX buffer
-        let _packet = self.current_dma.insert(packet);
         unsafe {
             self.radio
                 .packetptr
-                .write(|w| w.packetptr().bits(_packet.buffer.as_mut_ptr() as u32));
+                .write(|w| w.packetptr().bits(self.current_dma.as_mut().unwrap().buffer.as_mut_ptr() as u32));
         }
 
         // Disable all interrupts, then enable the ones we are handling
@@ -366,13 +362,17 @@ impl<'c> Radio<'c> {
             w.phyend().set_bit();
             w.ready().set_bit();
             w.rxready().set_bit();
-            w.framestart().clear_bit();
+
+            w.framestart().set_bit();
             w.payload().clear_bit();
+
             w
         });
 
         self.radio.shorts.reset();
 
+        dma_start_fence();
+        
         if self.radio.state.read().state().variant().unwrap() == STATE_A::TX {
             self.radio.shorts.modify(|_, w| {
                 w.phyend_disable().set_bit();
@@ -385,15 +385,15 @@ impl<'c> Radio<'c> {
 
         self.radio.shorts.modify(|_, w| {
             w.phyend_disable().clear_bit();
+
             w.rxready_start().set_bit();
             //w.end_start().set_bit(); // ! Not for IEEE 802.15.4, use PHYEND->START
-            w.phyend_start().set_bit();
+            w.phyend_start().clear_bit();
             w.disabled_rxen().set_bit();
             w
         });
         // start transfer
 
-        dma_start_fence();
 
         match self.radio.state.read().state().variant().unwrap() {
             STATE_A::DISABLED => {
@@ -411,19 +411,22 @@ impl<'c> Radio<'c> {
                 //self.radio.tasks_stop.write(|w| w.tasks_stop().set_bit());
             }
         }
-
-        retval
     }
 
-    pub fn poll(&mut self) -> Result<Option<Packet>, ()> {
+    fn shuffle(&mut self, packet: Packet) -> Packet {
+        // TODO: compiler fence
+        let res = self.current_dma.take().unwrap();
+        let _ = self.current_dma.insert(self.next_dma.take().unwrap());
+        let _ = self.next_dma.insert(packet);
+        res
+    }
+
+    pub fn poll(&mut self, mut packet: Packet) -> Result<Packet, ()> {
+        packet.set_len(0);
+
         if self.radio.events_end.read().events_end().bit_is_set() {
             self.radio.events_end.reset();
             rtt_target::rprintln!("poll:END");
-        }
-
-        if self.radio.events_phyend.read().events_phyend().bit_is_set() {
-            self.radio.events_phyend.reset();
-            rtt_target::rprintln!("poll:PHYEND");
         }
 
         if self.radio.events_ready.read().events_ready().bit_is_set() {
@@ -440,6 +443,7 @@ impl<'c> Radio<'c> {
         {
             self.radio.events_rxready.reset();
             rtt_target::rprintln!("poll:RXREADY");
+            //self.radio.tasks_start.write(|w| w.tasks_start().set_bit());
         }
 
         if self
@@ -464,7 +468,33 @@ impl<'c> Radio<'c> {
             rtt_target::rprintln!("poll:PAYLOAD");
         }
 
-        return Ok(None);
+        if self.radio.events_phyend.read().events_phyend().bit_is_set() {
+            self.radio.events_phyend.reset();
+            rtt_target::rprintln!("poll:PHYEND");
+
+            dma_end_fence();
+
+            // NOTE(unsafe) packetptr is double buffered, and can be updated for next packet after START
+            unsafe {
+                self.radio
+                    .packetptr
+                    .write(|w| w.packetptr().bits(self.next_dma.as_mut().unwrap().buffer.as_mut_ptr() as u32));
+            }
+
+
+            dma_start_fence();
+            self.radio.tasks_start.write(|w| w.tasks_start().set_bit());
+
+
+
+            let rxpacket = self.shuffle(packet);
+
+
+            return Ok(rxpacket);
+        }
+
+
+        return Ok(packet);
         //return Err(());
     }
 
