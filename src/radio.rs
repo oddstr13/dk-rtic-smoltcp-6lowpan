@@ -166,7 +166,6 @@ impl<'c> Radio<'c> {
         mut packet1: Packet,
         mut packet2: Packet,
     ) -> Self {
-
         packet1.set_len(0);
         packet2.set_len(0);
 
@@ -347,15 +346,7 @@ impl<'c> Radio<'c> {
         updated and prepared for the next transmission.
          */
 
-        // NOTE(unsafe) DMA transfer has not yet started
-        // set up RX buffer
-        unsafe {
-            self.radio
-                .packetptr
-                .write(|w| w.packetptr().bits(self.current_dma.as_mut().unwrap().buffer.as_mut_ptr() as u32));
-        }
-
-        // Disable all interrupts, then enable the ones we are handling
+        // Configure interrupts
         self.radio.intenset.reset();
         self.radio.intenset.write(|w| {
             w.end().set_bit();
@@ -369,31 +360,56 @@ impl<'c> Radio<'c> {
             w
         });
 
+        // Enter disabled state
         self.radio.shorts.reset();
 
-        dma_start_fence();
-        
-        if self.radio.state.read().state().variant().unwrap() == STATE_A::TX {
-            self.radio.shorts.modify(|_, w| {
-                w.phyend_disable().set_bit();
-                w.disabled_rxen().set_bit();
-                w
-            });
-
-            while self.radio.state.read().state().variant().unwrap() == STATE_A::TX {}
+        match self.radio.state.read().state().variant().unwrap() {
+            STATE_A::DISABLED | STATE_A::RXDISABLE | STATE_A::TXDISABLE => {}
+            STATE_A::RX => {
+                self.radio.tasks_stop.write(|w| w.tasks_stop().set_bit());
+                while self.radio.state.read().state().variant().unwrap() == STATE_A::RX {}
+                self.radio
+                    .tasks_disable
+                    .write(|w| w.tasks_disable().set_bit());
+            }
+            STATE_A::RXRU | STATE_A::RXIDLE | STATE_A::TXRU | STATE_A::TXIDLE => {
+                self.radio
+                    .tasks_disable
+                    .write(|w| w.tasks_disable().set_bit());
+            }
+            STATE_A::TX => {
+                self.radio.shorts.modify(|_, w| {
+                    w.phyend_disable().set_bit();
+                    w
+                });
+            }
         }
 
-        self.radio.shorts.modify(|_, w| {
-            w.phyend_disable().clear_bit();
+        while self.radio.state.read().state().variant().unwrap() != STATE_A::DISABLED {}
+        rtt_target::rprintln!("Radio disabled.");
 
+        // Set up shortcuts
+        self.radio.shorts.reset();
+        self.radio.shorts.modify(|_, w| {
             w.rxready_start().set_bit();
             //w.end_start().set_bit(); // ! Not for IEEE 802.15.4, use PHYEND->START
+            //w.phyend_start().set_bit();
             w.phyend_start().clear_bit();
             w.disabled_rxen().set_bit();
             w
         });
-        // start transfer
 
+        // NOTE(unsafe) DMA transfer has not yet started
+        // set up RX buffer
+        unsafe {
+            self.radio.packetptr.write(|w| {
+                w.packetptr()
+                    .bits(self.current_dma.as_mut().unwrap().buffer.as_mut_ptr() as u32)
+            });
+        }
+
+        // start transfer
+        dma_start_fence();
 
         match self.radio.state.read().state().variant().unwrap() {
             STATE_A::DISABLED => {
@@ -401,23 +417,39 @@ impl<'c> Radio<'c> {
             }
             STATE_A::RXDISABLE | STATE_A::TXDISABLE => {}
             STATE_A::RXRU | STATE_A::RXIDLE => {}
-            STATE_A::TXRU | STATE_A::TXIDLE => {
-                self.radio
-                    .tasks_disable
-                    .write(|w| w.tasks_disable().set_bit());
-            }
             STATE_A::RX => {}
-            STATE_A::TX => {
-                //self.radio.tasks_stop.write(|w| w.tasks_stop().set_bit());
+            STATE_A::TXRU | STATE_A::TXIDLE | STATE_A::TX => {
+                rtt_target::rprintln!("ERR: TX state should not be possible at this point");
             }
         }
+
+        //self.radio.packetptr.read();
+        //self.radio.packetptr.read();
+        while self.radio.state.read().state().variant().unwrap() != STATE_A::RX {}
+
+        // Set up for next packet
+        /*
+        unsafe {
+            self.radio.packetptr.write(|w| {
+                w.packetptr()
+                    .bits(self.next_dma.as_mut().unwrap().buffer.as_mut_ptr() as u32)
+            });
+        }
+        */
     }
 
+    /*
     fn shuffle(&mut self, packet: Packet) -> Packet {
         // TODO: compiler fence
         let res = self.current_dma.take().unwrap();
         let _ = self.current_dma.insert(self.next_dma.take().unwrap());
         let _ = self.next_dma.insert(packet);
+        res
+    }
+    */
+    fn shuffle(&mut self, packet: Packet) -> Packet {
+        let res = self.current_dma.take().unwrap();
+        let _ = self.current_dma.insert(packet);
         res
     }
 
@@ -470,29 +502,30 @@ impl<'c> Radio<'c> {
 
         if self.radio.events_phyend.read().events_phyend().bit_is_set() {
             self.radio.events_phyend.reset();
-            rtt_target::rprintln!("poll:PHYEND");
+            rtt_target::rprintln!(
+                "poll:PHYEND {}, {}",
+                self.current_dma.as_ref().unwrap().len(),
+                self.next_dma.as_ref().unwrap().len()
+            );
 
+            let rxpacket = self.shuffle(packet);
             dma_end_fence();
 
             // NOTE(unsafe) packetptr is double buffered, and can be updated for next packet after START
             unsafe {
-                self.radio
-                    .packetptr
-                    .write(|w| w.packetptr().bits(self.next_dma.as_mut().unwrap().buffer.as_mut_ptr() as u32));
+                self.radio.packetptr.write(|w| {
+                    w.packetptr()
+                        .bits(self.current_dma.as_mut().unwrap().buffer.as_mut_ptr() as u32)
+                });
             }
-
-
             dma_start_fence();
+
+            // Start RX of next packet
             self.radio.tasks_start.write(|w| w.tasks_start().set_bit());
-
-
-
-            let rxpacket = self.shuffle(packet);
-
+            //while self.radio.state.read().state().variant().unwrap() != STATE_A::RX {}
 
             return Ok(rxpacket);
         }
-
 
         return Ok(packet);
         //return Err(());
