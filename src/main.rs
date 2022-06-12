@@ -13,7 +13,7 @@ use panic_rtt_target as _;
 use rtic::app;
 use rtt_target::{rprint, rprintln, rtt_init_print};
 
-use heapless::spsc::{Consumer, Producer, Queue};
+//use heapless::spsc::{Consumer, Producer, Queue};
 
 // USB Serial
 use hal::clocks::{self, Clocks};
