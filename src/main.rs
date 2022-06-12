@@ -179,18 +179,20 @@ mod app {
         rprintln!();
         rprintln!("radio_handler");
 
-        cx.shared.radio.lock(|radio| match radio.poll(cx.local.packet.take().unwrap()) {
-            Ok(packet) => {
-                if packet.len() > 0 {
-                    rprintln!("Packet: {}", packet.len());
-                    rprint!(str::from_utf8(&*packet).expect("invalid utf8"));
-                    rprintln!();
-                } else {
-                    rprintln!("No data");
+        cx.shared
+            .radio
+            .lock(|radio| match radio.poll(cx.local.packet.take().unwrap()) {
+                Ok(packet) => {
+                    if packet.len() > 0 {
+                        rprintln!("Packet: {}", packet.len());
+                        rprint!(str::from_utf8(&*packet).expect("invalid utf8"));
+                        rprintln!();
+                    } else {
+                        rprintln!("No data");
+                    }
+                    let _ = cx.local.packet.insert(packet);
                 }
-                let _ = cx.local.packet.insert(packet);
-            },
-            Err(_) => {}
-        });
+                Err(_) => {}
+            });
     }
 }
